@@ -4,7 +4,7 @@ Triage Gmail inbox using persona.md as context.
 - Important  → stays in inbox
 - Maybe      → archived to Triage/Maybe
 - Skim       → archived to Triage/Skim
-Nothing is ever deleted.
+Nothing is ever deleted. Processes all inbox messages via pagination.
 """
 
 from __future__ import annotations
@@ -17,6 +17,9 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 PERSONA_FILE = os.path.join(os.path.dirname(__file__), "persona.md")
 LABEL_MAYBE = "Triage/Maybe"
 LABEL_SKIM = "Triage/Skim"
+CLASSIFY_BATCH = 75   # emails per Claude call
+META_WORKERS = 20     # parallel metadata fetches
+LABEL_WORKERS = 20    # parallel label operations
 
 
 # ── Gmail helpers ─────────────────────────────────────────────────────────────
@@ -29,13 +32,11 @@ def run_gws(*args) -> dict:
 
 
 def get_or_create_label(name: str) -> str:
-    """Return label ID, creating the label if it doesn't exist."""
     data = run_gws("gmail", "users", "labels", "list",
                    "--params", json.dumps({"userId": "me"}), "--format", "json")
     for label in data.get("labels", []):
         if label["name"] == name:
             return label["id"]
-
     created = run_gws("gmail", "users", "labels", "create",
                       "--params", json.dumps({"userId": "me"}),
                       "--json", json.dumps({"name": name}),
@@ -44,12 +45,25 @@ def get_or_create_label(name: str) -> str:
     return created["id"]
 
 
-def fetch_inbox_ids(max_results: int = 100) -> list[str]:
-    data = run_gws("gmail", "users", "messages", "list",
-                   "--params", json.dumps({"userId": "me", "maxResults": max_results,
-                                           "labelIds": ["INBOX"]}),
-                   "--format", "json")
-    return [m["id"] for m in data.get("messages", [])]
+def fetch_all_inbox_ids() -> list[str]:
+    """Paginate through all inbox messages and return every ID."""
+    all_ids = []
+    page_token = None
+    page = 1
+    while True:
+        params = {"userId": "me", "maxResults": 500, "labelIds": ["INBOX"]}
+        if page_token:
+            params["pageToken"] = page_token
+        data = run_gws("gmail", "users", "messages", "list",
+                       "--params", json.dumps(params), "--format", "json")
+        messages = data.get("messages", [])
+        all_ids.extend(m["id"] for m in messages)
+        print(f"  Page {page}: {len(all_ids)} IDs fetched...", flush=True)
+        page_token = data.get("nextPageToken")
+        if not page_token:
+            break
+        page += 1
+    return all_ids
 
 
 def get_message_meta(msg_id: str) -> dict | None:
@@ -74,24 +88,51 @@ def get_message_meta(msg_id: str) -> dict | None:
         return None
 
 
+def fetch_metadata_batch(ids: list[str]) -> list[dict]:
+    """Fetch metadata for a list of IDs in parallel."""
+    results = []
+    with ThreadPoolExecutor(max_workers=META_WORKERS) as executor:
+        futures = {executor.submit(get_message_meta, mid): mid for mid in ids}
+        for future in as_completed(futures):
+            meta = future.result()
+            if meta:
+                results.append(meta)
+    return results
+
+
 def apply_label_and_archive(msg_id: str, label_id: str):
-    """Add a label and remove from inbox (archive)."""
     run_gws("gmail", "users", "messages", "modify",
             "--params", json.dumps({"userId": "me", "id": msg_id}),
             "--json", json.dumps({"addLabelIds": [label_id], "removeLabelIds": ["INBOX"]}),
             "--format", "json")
 
 
+def archive_batch(classifications: list[dict], label_ids: dict) -> tuple[int, int]:
+    """Apply labels to a batch in parallel. Returns (archived, errors)."""
+    to_archive = [(c["id"], label_ids[c["category"]])
+                  for c in classifications if c.get("category") in ("maybe", "skim")]
+    archived = errors = 0
+    with ThreadPoolExecutor(max_workers=LABEL_WORKERS) as executor:
+        futures = {executor.submit(apply_label_and_archive, mid, lid): mid
+                   for mid, lid in to_archive}
+        for future in as_completed(futures):
+            try:
+                future.result()
+                archived += 1
+            except Exception as e:
+                print(f"  Warning: {e}", file=sys.stderr)
+                errors += 1
+    return archived, errors
+
+
 # ── Claude classification ─────────────────────────────────────────────────────
 
-def classify_emails(emails: list[dict], persona: str) -> list[dict]:
-    """Ask Claude to classify each email as important/maybe/skim."""
+def classify_batch(emails: list[dict], persona: str) -> list[dict]:
     email_list = "\n".join(
         f'ID:{e["id"]} | {"[LIST]" if e["is_newsletter"] else ""} FROM:{e["from"]} | '
         f'SUBJECT:{e["subject"]} | SNIPPET:{e["snippet"]}'
         for e in emails
     )
-
     prompt = f"""You are triaging a Gmail inbox. Using the persona profile below, classify each email.
 
 ## Persona
@@ -108,7 +149,8 @@ Classify each email as exactly one of:
 
 Rules:
 - Anything with [LIST] tag is a newsletter/marketing list — default to skim unless it directly matches a known deep interest
-- Sent-from-real-person emails lean important/maybe
+- Transactional emails (order confirmations, bills, appointments, shipping) → important
+- Real-person emails → important or maybe
 - Use the persona to judge relevance — don't guess generically
 
 Respond with ONLY valid JSON, no explanation, no markdown fences:
@@ -124,83 +166,87 @@ Respond with ONLY valid JSON, no explanation, no markdown fences:
     if result.returncode != 0:
         raise RuntimeError(f"claude CLI error: {result.stderr.strip()}")
 
-    # Extract JSON from response (claude may add surrounding text)
     text = result.stdout.strip()
-    start = text.find("[")
-    end = text.rfind("]") + 1
+    start, end = text.find("["), text.rfind("]") + 1
     if start == -1 or end == 0:
-        raise ValueError(f"No JSON array found in Claude response:\n{text[:500]}")
-
+        raise ValueError(f"No JSON in Claude response:\n{text[:300]}")
     return json.loads(text[start:end])
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
-    print("📬 emailai — triaging inbox\n")
+    print("📬 emailai — triaging inbox (all messages)\n")
 
-    # Load persona
     if not os.path.exists(PERSONA_FILE):
         print("Error: persona.md not found. Run learn_persona.py first.", file=sys.stderr)
         sys.exit(1)
     with open(PERSONA_FILE) as f:
         persona = f.read()
 
-    # Ensure labels exist
     print("Step 1: Setting up Gmail labels...")
     label_maybe_id = get_or_create_label(LABEL_MAYBE)
     label_skim_id = get_or_create_label(LABEL_SKIM)
     label_ids = {"maybe": label_maybe_id, "skim": label_skim_id}
-    print(f"  Labels ready: {LABEL_MAYBE}, {LABEL_SKIM}\n")
+    print(f"  Labels ready.\n")
 
-    # Fetch inbox
-    print("Step 2: Fetching inbox...")
-    ids = fetch_inbox_ids(max_results=100)
-    print(f"  Found {len(ids)} messages, fetching metadata (parallel)...")
-    emails = []
-    with ThreadPoolExecutor(max_workers=15) as executor:
-        futures = {executor.submit(get_message_meta, mid): mid for mid in ids}
-        for future in as_completed(futures):
-            meta = future.result()
-            if meta:
-                emails.append(meta)
-    print(f"  Got metadata for {len(emails)} messages\n")
+    print("Step 2: Fetching all inbox message IDs...")
+    all_ids = fetch_all_inbox_ids()
+    total = len(all_ids)
+    print(f"  Total inbox messages: {total}\n")
 
-    # Classify
-    print("Step 3: Classifying with Claude...")
-    classifications = classify_emails(emails, persona)
+    totals = {"important": 0, "maybe": 0, "skim": 0}
+    total_archived = 0
+    total_errors = 0
+    processed = 0
 
-    counts = {"important": 0, "maybe": 0, "skim": 0, "unknown": 0}
-    for c in classifications:
-        cat = c.get("category", "unknown")
-        counts[cat] = counts.get(cat, 0) + 1
+    print(f"Step 3: Processing in batches of {CLASSIFY_BATCH}...\n")
 
-    print(f"  Results: {counts['important']} important, "
-          f"{counts['maybe']} maybe, {counts['skim']} skim\n")
+    # Chunk IDs into batches
+    for batch_start in range(0, total, CLASSIFY_BATCH):
+        batch_ids = all_ids[batch_start:batch_start + CLASSIFY_BATCH]
+        batch_num = batch_start // CLASSIFY_BATCH + 1
+        total_batches = (total + CLASSIFY_BATCH - 1) // CLASSIFY_BATCH
 
-    # Apply labels
-    print("Step 4: Applying labels and archiving...")
-    archived = 0
-    errors = 0
-    for c in classifications:
-        cat = c.get("category")
-        if cat in ("maybe", "skim"):
-            try:
-                apply_label_and_archive(c["id"], label_ids[cat])
-                archived += 1
-            except Exception as e:
-                print(f"  Warning: could not process {c['id']}: {e}", file=sys.stderr)
-                errors += 1
+        print(f"  Batch {batch_num}/{total_batches} "
+              f"(messages {batch_start + 1}–{min(batch_start + CLASSIFY_BATCH, total)})...")
 
-    print(f"  Archived {archived} messages ({errors} errors)")
-    print(f"  {counts['important']} messages remain in inbox\n")
+        # Fetch metadata
+        emails = fetch_metadata_batch(batch_ids)
+        print(f"    Metadata fetched ({len(emails)} messages). Classifying...", flush=True)
 
-    # Summary
+        # Classify
+        try:
+            classifications = classify_batch(emails, persona)
+        except Exception as e:
+            print(f"    Classification error: {e}. Skipping batch.", file=sys.stderr)
+            continue
+
+        # Count
+        for c in classifications:
+            cat = c.get("category", "skim")
+            totals[cat] = totals.get(cat, 0) + 1
+
+        # Archive
+        archived, errors = archive_batch(classifications, label_ids)
+        total_archived += archived
+        total_errors += errors
+        processed += len(batch_ids)
+
+        print(f"    Archived {archived} | Running total: "
+              f"{totals['important']} important, "
+              f"{totals['maybe']} maybe, "
+              f"{totals['skim']} skim "
+              f"({processed}/{total} processed)\n")
+
     print("─" * 50)
-    print(f"✓ Inbox: {counts['important']} important messages")
-    print(f"  Gmail › {LABEL_MAYBE}: {counts['maybe']} messages")
-    print(f"  Gmail › {LABEL_SKIM}: {counts['skim']} messages")
-    print("\nNothing was deleted. All messages are still accessible by label.")
+    print(f"✓ Done. Processed {processed} messages.")
+    print(f"  Inbox (important): {totals['important']}")
+    print(f"  Triage/Maybe:      {totals['maybe']}")
+    print(f"  Triage/Skim:       {totals['skim']}")
+    if total_errors:
+        print(f"  Errors:            {total_errors}")
+    print("\nNothing was deleted.")
 
 
 if __name__ == "__main__":
