@@ -1,1 +1,14 @@
 persona.md
+
+# OAuth / credentials
+client_secret*.json
+
+# Runtime artifacts
+.triage_checkpoint
+triage_runs.jsonl
+*.log
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
