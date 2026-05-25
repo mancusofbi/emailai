@@ -12,5 +12,14 @@ if [ "$token_valid" = "True" ]; then
         || true
 else
     echo "Token not valid. Launching gws auth login..."
-    exec gws auth login
+    # Pipe through a line-reader that auto-opens the OAuth URL in the browser.
+    # gws prints the URL and then blocks listening on localhost for the callback,
+    # so opening as soon as we see the line is safe.
+    gws auth login 2>&1 | while IFS= read -r line; do
+        echo "$line"
+        if [[ "$line" == *"https://accounts.google.com"* ]]; then
+            url=$(printf '%s\n' "$line" | grep -oE 'https://accounts\.google\.com[^[:space:]]+')
+            [ -n "$url" ] && open "$url"
+        fi
+    done
 fi
